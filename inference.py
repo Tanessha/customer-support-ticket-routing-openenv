@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any
+from typing import Any, Optional
 
-from huggingface_hub.errors import HfHubHTTPError
-from huggingface_hub import InferenceClient
+from openai import OpenAI
 from pydantic import ValidationError
 
 from environment import CustomerSupportTicketRoutingEnvironment
@@ -14,21 +13,36 @@ from models import Action
 from tasks import TASKS
 
 
-SYSTEM_PROMPT = """You are an AI agent operating a customer support ticket routing environment.
-For the current unprocessed ticket, return a JSON object with:
-- ticket_id
-- category
-- priority
-- response
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
+HF_TOKEN = os.getenv("HF_TOKEN")
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+TASK_NAME = os.getenv("MY_ENV_V4_TASK", "all")
+BENCHMARK = os.getenv("MY_ENV_V4_BENCHMARK", "customer-support-ticket-routing")
+MAX_STEPS = int(os.getenv("MAX_STEPS", "8"))
+TEMPERATURE = float(os.getenv("TEMPERATURE", "0.2"))
 
-Valid categories: billing, technical, general, spam
-Valid priorities: low, medium, high
-For easy and medium tasks, response can be null.
-Return JSON only.
+SYSTEM_PROMPT = """You are an agent routing support tickets.
+Return JSON only with:
+- ticket_id (int)
+- category (billing|technical|general|spam)
+- priority (low|medium|high)
+- response (string or null)
+Select exactly one unprocessed ticket for each step.
 """
 
 
-def build_prompt(task: dict[str, Any], observation: dict[str, Any]) -> str:
+def _to_bool_str(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def _line_safe_error(error: Optional[str]) -> str:
+    if not error:
+        return "null"
+    return " ".join(str(error).split())
+
+
+def _build_prompt(task: dict[str, Any], observation: dict[str, Any]) -> str:
     return json.dumps(
         {
             "goal": task["goal"],
@@ -36,23 +50,23 @@ def build_prompt(task: dict[str, Any], observation: dict[str, Any]) -> str:
             "require_response": task["require_response"],
             "tickets": observation["tickets"],
             "processed_ticket_ids": observation["processed_ticket_ids"],
-            "instruction": "Choose exactly one unprocessed ticket and produce the next action.",
+            "instruction": "Pick the next best ticket to process.",
         },
-        indent=2,
+        separators=(",", ":"),
     )
 
 
-def heuristic_action(task: dict[str, Any], observation: dict[str, Any]) -> Action:
-    """Deterministic local fallback so baseline scoring works without hosted inference."""
+def _heuristic_action(task: dict[str, Any], observation: dict[str, Any]) -> Action:
     processed = set(observation["processed_ticket_ids"])
-    ticket = next(ticket for ticket in observation["tickets"] if ticket["id"] not in processed)
+    unprocessed = [t for t in observation["tickets"] if t["id"] not in processed]
+    ticket = unprocessed[0]
     text = ticket["text"].lower()
 
-    if any(term in text for term in ["charged", "payment", "invoice", "billed", "refund"]):
+    if any(term in text for term in ["charged", "payment", "invoice", "billed", "refund", "billing"]):
         category = "billing"
     elif any(term in text for term in ["crash", "log in", "login", "dashboard", "release", "export"]):
         category = "technical"
-    elif any(term in text for term in ["iphone", "click here", "won"]):
+    elif any(term in text for term in ["iphone", "click here", "won", "free money"]):
         category = "spam"
     else:
         category = "general"
@@ -63,81 +77,105 @@ def heuristic_action(task: dict[str, Any], observation: dict[str, Any]) -> Actio
         priority = "high"
     elif category in {"billing", "technical"} and ticket["sla_hours"] <= 8:
         priority = "high"
-    elif category == "general" and ticket["customer_tier"] == "free":
-        priority = "medium" if task["score_priority"] else "low"
+    elif category == "general" and bool(task["score_priority"]):
+        priority = "medium"
     else:
         priority = "medium"
 
-    response = None
-    if task["require_response"] and category != "spam":
+    response: Optional[str] = None
+    if bool(task["require_response"]) and category != "spam":
         if category == "billing":
-            response = "Thanks for flagging this billing issue. We will review the charge and refund eligibility."
+            response = "Thanks for reporting this billing issue. We will review the charge and refund path."
         elif category == "technical":
-            response = "We are investigating the urgent login issue and will prioritize restoring access."
+            response = "We are urgently investigating the login problem and will share updates."
         else:
-            response = "Happy to help with workspace admin settings and point you to the right place."
+            response = "Happy to help with workspace admin setup and next steps."
 
     return Action(ticket_id=ticket["id"], category=category, priority=priority, response=response)
 
 
-def run_task(client: InferenceClient, model_name: str, task_id: str) -> dict[str, Any]:
+def _llm_action(
+    client: OpenAI,
+    model_name: str,
+    task: dict[str, Any],
+    observation: dict[str, Any],
+) -> Action:
+    response = client.chat.completions.create(
+        model=model_name,
+        temperature=TEMPERATURE,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": _build_prompt(task, observation)},
+        ],
+    )
+    content = response.choices[0].message.content or "{}"
+    payload = json.loads(content)
+    return Action.model_validate(payload)
+
+
+def _action_str(action: Action) -> str:
+    return json.dumps(action.model_dump(mode="json"), separators=(",", ":"))
+
+
+def _run_episode(client: OpenAI, model_name: str, task_id: str) -> None:
     env = CustomerSupportTicketRoutingEnvironment()
     observation = env.reset(task_id)
     task = TASKS[task_id]
-    max_steps = len(task["tickets"]) + 2
-    step_count = 0
 
-    while not env.state().done and step_count < max_steps:
+    print(f"[START] task={task_id} env={BENCHMARK} model={model_name}")
+    rewards: list[float] = []
+
+    for step_n in range(1, MAX_STEPS + 1):
+        llm_error: Optional[str] = None
         try:
-            response = client.chat.completions.create(
-                model=model_name,
-                temperature=0,
-                max_tokens=200,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": build_prompt(task, observation.model_dump(mode="json"))},
-                ],
-            )
-            action_payload = json.loads(response.choices[0].message.content)
-            action = Action.model_validate(action_payload)
-        except (HfHubHTTPError, ValueError, ValidationError, json.JSONDecodeError):
-            action = heuristic_action(task, observation.model_dump(mode="json"))
+            action = _llm_action(client, model_name, task, observation.model_dump(mode="json"))
+        except (ValidationError, json.JSONDecodeError, Exception) as exc:
+            llm_error = f"llm_error:{type(exc).__name__}"
+            action = _heuristic_action(task, observation.model_dump(mode="json"))
 
         result = env.step(action)
+        rewards.append(result.reward)
         observation = result.observation
-        step_count += 1
 
-    return {
-        "task_id": task_id,
-        "score": grade_episode(task, env.state().predictions),
-    }
+        step_error = llm_error
+        if isinstance(result.info, dict) and result.info.get("message"):
+            msg = str(result.info["message"])
+            step_error = f"{step_error};{msg}" if step_error else msg
+
+        print(
+            f"[STEP]  step={step_n} action={_action_str(action)} "
+            f"reward={result.reward:.2f} done={_to_bool_str(result.done)} error={_line_safe_error(step_error)}"
+        )
+
+        if result.done:
+            break
+
+    final_state = env.state()
+    final_score = grade_episode(task, final_state.predictions)
+    final_score = max(0.0, min(1.0, final_score))
+    rewards_csv = ",".join(f"{reward:.2f}" for reward in rewards)
+    print(
+        f"[END]   success={_to_bool_str(final_state.done)} steps={len(rewards)} "
+        f"score={final_score:.2f} rewards={rewards_csv}"
+    )
+
+
+def _task_ids() -> list[str]:
+    if TASK_NAME.lower() in {"all", "*"}:
+        return list(TASKS.keys())
+    if TASK_NAME in TASKS:
+        return [TASK_NAME]
+    return [next(iter(TASKS))]
 
 
 def main() -> None:
-    api_key = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN")
-    base_url = os.getenv("API_BASE_URL")
-    model_name = os.getenv("MODEL_NAME", "meta-llama/Meta-Llama-3-8B-Instruct")
-    provider = os.getenv("HF_PROVIDER")
-
-    client_kwargs: dict[str, Any] = {}
-    if api_key:
-        client_kwargs["api_key"] = api_key
-    if base_url:
-        client_kwargs["base_url"] = base_url
-    elif provider:
-        client_kwargs["provider"] = provider
-        client_kwargs["model"] = model_name
-    else:
-        client_kwargs["model"] = model_name
-
-    client = InferenceClient(**client_kwargs)
-
-    results = [run_task(client, model_name, task_id) for task_id in TASKS]
-    average = round(sum(item["score"] for item in results) / len(results), 4)
-
-    print(json.dumps({"model": model_name, "results": results, "average_score": average}, indent=2))
+    client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
+    for task_id in _task_ids():
+        _run_episode(client, MODEL_NAME, task_id)
 
 
 if __name__ == "__main__":
     main()
+
+
