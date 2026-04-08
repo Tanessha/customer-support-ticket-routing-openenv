@@ -13,8 +13,8 @@ from models import Action
 from tasks import TASKS
 
 
-LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME") or os.getenv("IMAGE_NAME")
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY") or "hf_missing_token"
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
+HF_TOKEN = os.getenv("HF_TOKEN")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 TASK_NAME = os.getenv("MY_ENV_V4_TASK", "all")
@@ -153,7 +153,7 @@ def _run_episode(client: OpenAI, model_name: str, task_id: str) -> None:
 
     final_state = env.state()
     final_score = grade_episode(task, final_state.predictions)
-    final_score = max(0.0, min(1.0, final_score))
+    final_score = max(0.01, min(0.99, final_score))
     rewards_csv = ",".join(f"{reward:.2f}" for reward in rewards)
     print(
         f"[END]   success={_to_bool_str(final_state.done)} steps={len(rewards)} "
@@ -170,7 +170,7 @@ def _task_ids() -> list[str]:
 
 
 def main() -> None:
-    client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
+    client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
     for task_id in _task_ids():
         _run_episode(client, MODEL_NAME, task_id)
 

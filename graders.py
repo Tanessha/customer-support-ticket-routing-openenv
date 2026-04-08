@@ -3,6 +3,15 @@ from __future__ import annotations
 from typing import Dict, Optional
 
 
+MIN_TASK_SCORE = 0.01
+MAX_TASK_SCORE = 0.99
+
+
+def _strict_task_score(value: float) -> float:
+    """Ensure task-level scores are strictly within (0, 1)."""
+    return round(min(MAX_TASK_SCORE, max(MIN_TASK_SCORE, value)), 4)
+
+
 def _normalize_text(text: Optional[str]) -> str:
     return (text or "").strip().lower()
 
@@ -126,8 +135,9 @@ def grade_episode(task: Dict[str, object], predictions: Dict[int, Dict[str, Opti
         per_ticket_scores.append(ticket_grade["score"])
 
     if not per_ticket_scores:
-        return 0.0
-    return round(sum(per_ticket_scores) / len(per_ticket_scores), 4)
+        return _strict_task_score(0.0)
+    raw_score = sum(per_ticket_scores) / len(per_ticket_scores)
+    return _strict_task_score(raw_score)
 
 
 def grade_episode_breakdown(task: Dict[str, object], predictions: Dict[int, Dict[str, Optional[str]]]) -> Dict[str, object]:
