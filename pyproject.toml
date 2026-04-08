@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "customer-support-ticket-routing"
+version = "1.0.0"
+description = "OpenEnv-compatible customer support routing environment"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi==0.116.1",
+  "uvicorn[standard]==0.35.0",
+  "pydantic==2.11.7",
+  "openai==1.102.0",
+  "gradio==5.44.1",
+  "requests>=2.25.0",
+  "openenv-core",
+]
+
+[project.scripts]
+server = "server.app:main"
+
+[tool.setuptools]
+py-modules = ["environment", "models", "tasks", "graders", "inference", "client"]

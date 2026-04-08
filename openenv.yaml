@@ -1,0 +1,44 @@
+name: customer-support-ticket-routing
+version: 1.0.0
+description: OpenEnv-compatible environment for routing customer support tickets by category, priority, and optional response generation.
+entrypoint: server.app:app
+environment:
+  module: environment
+  class: CustomerSupportTicketRoutingEnvironment
+models:
+  action: models:Action
+  observation: models:Observation
+  state: models:State
+  step_result: models:StepResult
+api:
+  reset: /reset
+  step: /step
+  state: /state
+  tasks: /tasks
+  grader: /grader
+metadata:
+  domain: customer-support
+  tags:
+    - openenv
+    - customer-support
+    - routing
+    - classification
+    - reward-shaping
+  tasks:
+    - task_easy_classification
+    - task_medium_routing
+    - task_hard_full_resolution
+  reward_design:
+    correct_category: 0.4
+    correct_priority: 0.3
+    fast_resolution: 0.2
+    relevant_response: 0.1
+    wrong_classification_penalty: -0.3
+    ignoring_urgent_ticket_penalty: -0.5
+    sla_delay_penalty_per_step: -0.05
+  grader_features:
+    - deterministic
+    - per-ticket breakdown
+    - response relevance
+    - response safety penalty
+    - episode coverage tracking
