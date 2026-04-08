@@ -153,7 +153,7 @@ def _run_episode(client: OpenAI, model_name: str, task_id: str) -> None:
 
     final_state = env.state()
     final_score = grade_episode(task, final_state.predictions)
-    final_score = max(0.0, min(1.0, final_score))
+    final_score = max(0.01, min(0.99, final_score))
     rewards_csv = ",".join(f"{reward:.2f}" for reward in rewards)
     print(
         f"[END]   success={_to_bool_str(final_state.done)} steps={len(rewards)} "
