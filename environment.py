@@ -44,7 +44,10 @@ class CustomerSupportTicketRoutingEnvironment:
                 observation=self._build_observation(),
                 reward=0.0,
                 done=True,
-                info={"message": "Episode already complete.", "score": grade_episode_breakdown(self._task, self._predictions)["score"]},
+                info={
+                    "message": "Episode already complete.",
+                    "score": grade_episode_breakdown(self._task, self._predictions, self._processed_ticket_ids)["score"],
+                },
             )
 
         self._current_step += 1
@@ -82,7 +85,7 @@ class CustomerSupportTicketRoutingEnvironment:
         step_reward, reward_details = self._compute_step_reward(ticket, ticket_grade)
         self._cumulative_reward += step_reward
         self._done = len(self._processed_ticket_ids) == len(self._task["tickets"])
-        breakdown = grade_episode_breakdown(self._task, self._predictions)
+        breakdown = grade_episode_breakdown(self._task, self._predictions, self._processed_ticket_ids)
         self._latest_grader_breakdown = breakdown["tickets"]
 
         info = {
@@ -128,10 +131,10 @@ class CustomerSupportTicketRoutingEnvironment:
         )
 
     def grader(self) -> float:
-        return grade_episode_breakdown(self._task, self._predictions)["score"]
+        return grade_episode_breakdown(self._task, self._predictions, self._processed_ticket_ids)["score"]
 
     def grader_breakdown(self) -> Dict[str, object]:
-        return grade_episode_breakdown(self._task, self._predictions)
+        return grade_episode_breakdown(self._task, self._predictions, self._processed_ticket_ids)
 
     def _compute_step_reward(self, ticket: Dict[str, object], ticket_grade: Dict[str, float]) -> tuple[float, Dict[str, float]]:
         """Compute dense per-step reward with correctness, urgency, and SLA timing signals."""

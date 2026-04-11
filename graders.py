@@ -73,6 +73,20 @@ def grade_ticket(
     require_response: bool,
 ) -> Dict[str, float]:
     """Grade one ticket using deterministic weighted scoring."""
+    is_unprocessed = predicted.get("category") is None and predicted.get("priority") is None and not predicted.get("response")
+    if is_unprocessed:
+        return {
+            "score": 0.0,
+            "category_accuracy": 0.0,
+            "priority_accuracy": 0.0 if score_priority else 1.0,
+            "response_quality": 0.0 if require_response else 1.0,
+            "category_correct": 0.0,
+            "priority_correct": 0.0 if score_priority else 1.0,
+            "response_content_score": 0.0 if require_response else 1.0,
+            "response_format_score": 0.0 if require_response else 1.0,
+            "response_safety_penalty": 0.0,
+            "response_score": 0.0 if require_response else 1.0,
+        }
 
     category_correct = predicted.get("category") == truth["category"]
     category_accuracy = 1.0 if category_correct else 0.0
@@ -118,7 +132,36 @@ def grade_ticket(
     }
 
 
-def grade_episode(task: Dict[str, object], predictions: Dict[int, Dict[str, Optional[str]]]) -> float:
+def _urgency_order_score(task: Dict[str, object], processed_order: Optional[list[int]]) -> float:
+    """Pairwise ordering score: high-priority tickets should be resolved before lower-priority ones."""
+    if not processed_order:
+        return 0.0
+
+    ground_truth = task["ground_truth"]
+    high_ids = [ticket["id"] for ticket in task["tickets"] if ground_truth[ticket["id"]]["priority"] == "high"]
+    non_high_ids = [ticket["id"] for ticket in task["tickets"] if ground_truth[ticket["id"]]["priority"] != "high"]
+    if not high_ids or not non_high_ids:
+        return 1.0
+
+    index = {ticket_id: pos for pos, ticket_id in enumerate(processed_order)}
+    wins = 0
+    total = 0
+    for high_id in high_ids:
+        for other_id in non_high_ids:
+            if high_id in index and other_id in index:
+                total += 1
+                if index[high_id] < index[other_id]:
+                    wins += 1
+    if total == 0:
+        return 0.0
+    return wins / total
+
+
+def grade_episode(
+    task: Dict[str, object],
+    predictions: Dict[int, Dict[str, Optional[str]]],
+    processed_order: Optional[list[int]] = None,
+) -> float:
     """Return the mean deterministic episode score in [0, 1]."""
     ground_truth = task["ground_truth"]
     per_ticket_scores = []
@@ -136,11 +179,18 @@ def grade_episode(task: Dict[str, object], predictions: Dict[int, Dict[str, Opti
 
     if not per_ticket_scores:
         return _strict_task_score(0.0)
-    raw_score = sum(per_ticket_scores) / len(per_ticket_scores)
+    base_score = sum(per_ticket_scores) / len(per_ticket_scores)
+    ordering_score = _urgency_order_score(task, processed_order)
+    # Blend correctness with trajectory quality to better reflect agentic performance.
+    raw_score = (0.9 * base_score) + (0.1 * ordering_score)
     return _strict_task_score(raw_score)
 
 
-def grade_episode_breakdown(task: Dict[str, object], predictions: Dict[int, Dict[str, Optional[str]]]) -> Dict[str, object]:
+def grade_episode_breakdown(
+    task: Dict[str, object],
+    predictions: Dict[int, Dict[str, Optional[str]]],
+    processed_order: Optional[list[int]] = None,
+) -> Dict[str, object]:
     """Return detailed deterministic grader output for the full episode."""
     ground_truth = task["ground_truth"]
     ticket_breakdown: Dict[int, Dict[str, float]] = {}
@@ -155,12 +205,15 @@ def grade_episode_breakdown(task: Dict[str, object], predictions: Dict[int, Dict
         )
 
     coverage = len(predictions) / max(1, len(task["tickets"]))
-    episode_score = grade_episode(task, predictions)
+    base_only_score = grade_episode(task, predictions, processed_order=None)
+    ordering_score = _urgency_order_score(task, processed_order)
+    episode_score = grade_episode(task, predictions, processed_order=processed_order)
 
     return {
         "score": episode_score,
-        "base_score": episode_score,
+        "base_score": base_only_score,
         "completion_bonus": 0.0,
+        "urgency_order_score": round(ordering_score, 4),
         "coverage": round(coverage, 4),
         "tickets": ticket_breakdown,
     }
