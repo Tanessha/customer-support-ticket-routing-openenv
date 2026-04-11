@@ -6,7 +6,7 @@ from openenv_core.client_types import StepResult
 from openenv_core.env_server.types import State
 from openenv_core.http_env_client import HTTPEnvClient
 
-from .models import Action, Observation
+from models import Action, Observation
 
 
 class CustomerSupportTicketRoutingEnv(HTTPEnvClient[Action, Observation]):
@@ -29,4 +29,3 @@ class CustomerSupportTicketRoutingEnv(HTTPEnvClient[Action, Observation]):
             episode_id=payload.get("task_id"),
             step_count=payload.get("current_step", 0),
         )
-

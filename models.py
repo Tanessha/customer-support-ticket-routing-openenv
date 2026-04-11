@@ -69,6 +69,8 @@ class State(BaseModel):
     total_tickets: int
     processed_ticket_ids: List[int] = Field(default_factory=list)
     predictions: Dict[int, Dict[str, Optional[str]]] = Field(default_factory=dict)
+    action_history: List[Dict[str, object]] = Field(default_factory=list)
+    unresolved_high_priority: int = 0
     cumulative_reward: float = 0.0
     latest_grader_breakdown: Dict[int, Dict[str, float]] = Field(default_factory=dict)
     done: bool = False

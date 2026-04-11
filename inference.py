@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from openai import OpenAI
 from pydantic import ValidationError
 
 from environment import CustomerSupportTicketRoutingEnvironment
-from graders import grade_episode
 from models import Action
 from tasks import TASKS
+from tools.policy_engine import TicketPolicyEngine
 
 
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
@@ -21,6 +24,7 @@ TASK_NAME = os.getenv("MY_ENV_V4_TASK", "all")
 BENCHMARK = os.getenv("MY_ENV_V4_BENCHMARK", "customer-support-ticket-routing")
 MAX_STEPS = int(os.getenv("MAX_STEPS", "8"))
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.2"))
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs"))
 
 SYSTEM_PROMPT = """You are an agent routing support tickets.
 Return JSON only with:
@@ -30,6 +34,13 @@ Return JSON only with:
 - response (string or null)
 Select exactly one unprocessed ticket for each step.
 """
+
+
+@dataclass
+class EpisodeMemory:
+    processed_ticket_ids: list[int] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    rationale: list[str] = field(default_factory=list)
 
 
 def _to_bool_str(value: bool) -> str:
@@ -43,63 +54,31 @@ def _line_safe_error(error: Optional[str]) -> str:
 
 
 def _build_prompt(task: dict[str, Any], observation: dict[str, Any]) -> str:
+    unresolved = [ticket for ticket in observation["tickets"] if ticket["id"] not in set(observation["processed_ticket_ids"])]
     return json.dumps(
         {
             "goal": task["goal"],
             "difficulty": task["difficulty"],
             "require_response": task["require_response"],
-            "tickets": observation["tickets"],
+            "tickets": unresolved,
             "processed_ticket_ids": observation["processed_ticket_ids"],
-            "instruction": "Pick the next best ticket to process.",
+            "instruction": (
+                "Process one unprocessed ticket. Prioritize urgent SLA/high-priority items first. "
+                "For hard tasks provide concise, safe, customer-facing response."
+            ),
         },
         separators=(",", ":"),
     )
 
 
-def _heuristic_action(task: dict[str, Any], observation: dict[str, Any]) -> Action:
-    processed = set(observation["processed_ticket_ids"])
-    unprocessed = [t for t in observation["tickets"] if t["id"] not in processed]
-    ticket = unprocessed[0]
-    text = ticket["text"].lower()
-
-    if any(term in text for term in ["charged", "payment", "invoice", "billed", "refund", "billing"]):
-        category = "billing"
-    elif any(term in text for term in ["crash", "log in", "login", "dashboard", "release", "export"]):
-        category = "technical"
-    elif any(term in text for term in ["iphone", "click here", "won", "free money"]):
-        category = "spam"
-    else:
-        category = "general"
-
-    if category == "spam":
-        priority = "low"
-    elif ticket["customer_tier"] == "premium" and ticket["sentiment"] == "angry":
-        priority = "high"
-    elif category in {"billing", "technical"} and ticket["sla_hours"] <= 8:
-        priority = "high"
-    elif category == "general" and bool(task["score_priority"]):
-        priority = "medium"
-    else:
-        priority = "medium"
-
-    response: Optional[str] = None
-    if bool(task["require_response"]) and category != "spam":
-        if category == "billing":
-            response = "Thanks for reporting this billing issue. We will review the charge and refund path."
-        elif category == "technical":
-            response = "We are urgently investigating the login problem and will share updates."
-        else:
-            response = "Happy to help with workspace admin setup and next steps."
-
-    return Action(ticket_id=ticket["id"], category=category, priority=priority, response=response)
-
-
 def _llm_action(
-    client: OpenAI,
+    client: Optional[OpenAI],
     model_name: str,
     task: dict[str, Any],
     observation: dict[str, Any],
 ) -> Action:
+    if client is None:
+        raise RuntimeError("MissingHFToken")
     response = client.chat.completions.create(
         model=model_name,
         temperature=TEMPERATURE,
@@ -114,29 +93,79 @@ def _llm_action(
     return Action.model_validate(payload)
 
 
+def _select_action(
+    client: Optional[OpenAI],
+    model_name: str,
+    task: dict[str, Any],
+    observation: dict[str, Any],
+    memory: EpisodeMemory,
+    policy: TicketPolicyEngine,
+) -> tuple[Action, Optional[str]]:
+    llm_error: Optional[str] = None
+    llm_candidate: Optional[Action] = None
+    try:
+        llm_candidate = _llm_action(client, model_name, task, observation)
+    except (ValidationError, json.JSONDecodeError, Exception) as exc:
+        llm_error = f"llm_error:{type(exc).__name__}"
+        memory.errors.append(llm_error)
+
+    action = policy.repair_action(task, observation, llm_candidate)
+    inferred = policy.infer_ticket(task, next(ticket for ticket in observation["tickets"] if ticket["id"] == action.ticket_id))
+    memory.rationale.append(f"ticket={action.ticket_id}:{inferred.rationale}")
+    return action, llm_error
+
+
 def _action_str(action: Action) -> str:
     return json.dumps(action.model_dump(mode="json"), separators=(",", ":"))
 
 
-def _run_episode(client: OpenAI, model_name: str, task_id: str) -> None:
+def _persist_episode_report(
+    task_id: str,
+    model_name: str,
+    rewards: list[float],
+    success: bool,
+    final_score: float,
+) -> None:
+    """Persist lightweight run artifacts for debugging and judge-friendly transparency."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    record = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "task_id": task_id,
+        "model": model_name,
+        "success": success,
+        "steps": len(rewards),
+        "score": round(final_score, 4),
+        "rewards": [round(reward, 4) for reward in rewards],
+    }
+    jsonl_path = OUTPUT_DIR / "episode_reports.jsonl"
+    with jsonl_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+
+
+def _run_episode(client: Optional[OpenAI], model_name: str, task_id: str) -> None:
     env = CustomerSupportTicketRoutingEnvironment()
     observation = env.reset(task_id)
     task = TASKS[task_id]
+    memory = EpisodeMemory()
+    policy = TicketPolicyEngine()
 
     print(f"[START] task={task_id} env={BENCHMARK} model={model_name}")
     rewards: list[float] = []
 
     for step_n in range(1, MAX_STEPS + 1):
-        llm_error: Optional[str] = None
-        try:
-            action = _llm_action(client, model_name, task, observation.model_dump(mode="json"))
-        except (ValidationError, json.JSONDecodeError, Exception) as exc:
-            llm_error = f"llm_error:{type(exc).__name__}"
-            action = _heuristic_action(task, observation.model_dump(mode="json"))
+        action, llm_error = _select_action(
+            client=client,
+            model_name=model_name,
+            task=task,
+            observation=observation.model_dump(mode="json"),
+            memory=memory,
+            policy=policy,
+        )
 
         result = env.step(action)
         rewards.append(result.reward)
         observation = result.observation
+        memory.processed_ticket_ids = list(observation.processed_ticket_ids)
 
         step_error = llm_error
         if isinstance(result.info, dict) and result.info.get("message"):
@@ -151,13 +180,20 @@ def _run_episode(client: OpenAI, model_name: str, task_id: str) -> None:
         if result.done:
             break
 
+    final_breakdown = env.grader_breakdown()
     final_state = env.state()
-    final_score = grade_episode(task, final_state.predictions)
-    final_score = max(0.01, min(0.99, final_score))
+    final_score = float(final_breakdown["score"])
     rewards_csv = ",".join(f"{reward:.2f}" for reward in rewards)
     print(
         f"[END]   success={_to_bool_str(final_state.done)} steps={len(rewards)} "
         f"score={final_score:.2f} rewards={rewards_csv}"
+    )
+    _persist_episode_report(
+        task_id=task_id,
+        model_name=model_name,
+        rewards=rewards,
+        success=final_state.done,
+        final_score=final_score,
     )
 
 
@@ -170,7 +206,7 @@ def _task_ids() -> list[str]:
 
 
 def main() -> None:
-    client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
+    client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL) if HF_TOKEN else None
     for task_id in _task_ids():
         _run_episode(client, MODEL_NAME, task_id)
 

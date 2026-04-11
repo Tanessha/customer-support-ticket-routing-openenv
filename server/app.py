@@ -4,6 +4,7 @@ import os
 from typing import Optional
 
 import gradio as gr
+import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
@@ -11,6 +12,8 @@ import uvicorn
 from environment import CustomerSupportTicketRoutingEnvironment
 from models import Action, Observation, State, StepResult
 from tasks import TASKS, list_tasks
+from utils.json_utils import model_or_value_to_json
+from utils.viz import build_visual_frames
 
 
 app = FastAPI(
@@ -21,6 +24,7 @@ app = FastAPI(
 
 env = CustomerSupportTicketRoutingEnvironment()
 ui_env = CustomerSupportTicketRoutingEnvironment()
+ui_reward_history: list[dict[str, float]] = []
 
 
 class ResetRequest(BaseModel):
@@ -68,28 +72,36 @@ def grader() -> dict[str, object]:
     return {"task_id": env.state().task_id, **env.grader_breakdown()}
 
 
-def _stringify_dict_keys(value: object) -> object:
-    if isinstance(value, dict):
-        return {str(key): _stringify_dict_keys(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_stringify_dict_keys(item) for item in value]
-    return value
-
-
 def _json_dump(value: object) -> dict[str, object]:
-    if hasattr(value, "model_dump"):
-        value = value.model_dump(mode="json")
-    return _stringify_dict_keys(value)  # type: ignore[return-value]
+    return model_or_value_to_json(value)
 
 
-def _ui_reset(task_id: str) -> tuple[dict[str, object], dict[str, object], dict[str, object], str]:
+def _reset_visual_buffers() -> None:
+    ui_reward_history.clear()
+
+
+def _build_visual_frames(current_state: State, grader_payload: dict[str, object]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    return build_visual_frames(
+        cumulative_reward=float(current_state.cumulative_reward),
+        reward_history=ui_reward_history,
+        grader_payload=grader_payload,
+    )
+
+
+def _ui_reset(task_id: str) -> tuple[dict[str, object], dict[str, object], dict[str, object], str, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    _reset_visual_buffers()
     observation = ui_env.reset(task_id or None)
     current_state = ui_env.state()
+    grader_payload = _json_dump({"task_id": current_state.task_id, **ui_env.grader_breakdown()})
+    progress_df, ticket_df, quality_df = _build_visual_frames(current_state, grader_payload)
     return (
         _json_dump(observation),
         _json_dump(current_state),
-        _json_dump({"task_id": current_state.task_id, **ui_env.grader_breakdown()}),
+        grader_payload,
         f"Reset complete: task={current_state.task_id}",
+        progress_df,
+        ticket_df,
+        quality_df,
     )
 
 
@@ -98,7 +110,7 @@ def _ui_step(
     category: str,
     priority: str,
     response: str,
-) -> tuple[dict[str, object], dict[str, object], dict[str, object], str]:
+) -> tuple[dict[str, object], dict[str, object], dict[str, object], str, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     action = Action(
         ticket_id=int(ticket_id),
         category=category,
@@ -107,28 +119,51 @@ def _ui_step(
     )
     result = ui_env.step(action)
     current_state = ui_env.state()
+    grader_payload = _json_dump({"task_id": current_state.task_id, **ui_env.grader_breakdown()})
+    step_n = int(result.info.get("current_step", current_state.current_step)) if isinstance(result.info, dict) else int(current_state.current_step)
+    episode_score = float(result.info.get("episode_score", grader_payload.get("score", 0.0))) if isinstance(result.info, dict) else float(grader_payload.get("score", 0.0))
+    ui_reward_history.append(
+        {
+            "step": float(step_n),
+            "cumulative_reward": float(current_state.cumulative_reward),
+            "episode_score": episode_score,
+        }
+    )
+    progress_df, ticket_df, quality_df = _build_visual_frames(current_state, grader_payload)
     return (
         _json_dump(result),
         _json_dump(current_state),
-        _json_dump({"task_id": current_state.task_id, **ui_env.grader_breakdown()}),
+        grader_payload,
         "Step processed.",
+        progress_df,
+        ticket_df,
+        quality_df,
     )
 
 
-def _ui_state() -> tuple[dict[str, object], str]:
-    return _json_dump(ui_env.state()), "State updated."
+def _ui_state() -> tuple[dict[str, object], str, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    current_state = ui_env.state()
+    grader_payload = _json_dump({"task_id": current_state.task_id, **ui_env.grader_breakdown()})
+    progress_df, ticket_df, quality_df = _build_visual_frames(current_state, grader_payload)
+    return _json_dump(current_state), "State updated.", progress_df, ticket_df, quality_df
 
 
 def _ui_tasks() -> tuple[dict[str, object], str]:
     return _json_dump({"tasks": list_tasks(), "action_schema": Action.model_json_schema()}), "Tasks loaded."
 
 
-def _ui_grader() -> tuple[dict[str, object], str]:
+def _ui_grader() -> tuple[dict[str, object], str, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     current_state = ui_env.state()
-    return _json_dump({"task_id": current_state.task_id, **ui_env.grader_breakdown()}), "Grader updated."
+    grader_payload = _json_dump({"task_id": current_state.task_id, **ui_env.grader_breakdown()})
+    progress_df, ticket_df, quality_df = _build_visual_frames(current_state, grader_payload)
+    return grader_payload, "Grader updated.", progress_df, ticket_df, quality_df
 
 
 def _build_web_ui() -> gr.Blocks:
+    initial_state = ui_env.state()
+    initial_grader = _json_dump({"task_id": initial_state.task_id, **ui_env.grader_breakdown()})
+    initial_progress, initial_tickets, initial_quality = _build_visual_frames(initial_state, initial_grader)
+
     with gr.Blocks(title="Customer Support Ticket Routing Web UI") as demo:
         gr.Markdown("# Customer Support Ticket Routing Environment")
         gr.Markdown("Interactive controls for `/reset`, `/step`, `/state`, `/tasks`, and `/grader`.")
@@ -171,19 +206,44 @@ def _build_web_ui() -> gr.Blocks:
         tasks_json = gr.JSON(label="Tasks")
         status_box = gr.Textbox(label="Status", interactive=False)
 
+        gr.Markdown("## Evaluation Visuals")
+        reward_plot = gr.LinePlot(
+            value=initial_progress,
+            x="step",
+            y="cumulative_reward",
+            title="Cumulative Reward by Step",
+            x_title="Step",
+            y_title="Cumulative Reward",
+        )
+        with gr.Row():
+            ticket_plot = gr.BarPlot(
+                value=initial_tickets,
+                x="ticket_id",
+                y="score",
+                title="Per-Ticket Score",
+                y_lim=[0, 1],
+            )
+            quality_plot = gr.BarPlot(
+                value=initial_quality,
+                x="metric",
+                y="value",
+                title="Quality Components",
+                y_lim=[0, 1],
+            )
+
         reset_btn.click(
             _ui_reset,
             inputs=[task_id],
-            outputs=[step_json, state_json, grader_json, status_box],
+            outputs=[step_json, state_json, grader_json, status_box, reward_plot, ticket_plot, quality_plot],
         )
         step_btn.click(
             _ui_step,
             inputs=[ticket_id, category, priority, response],
-            outputs=[step_json, state_json, grader_json, status_box],
+            outputs=[step_json, state_json, grader_json, status_box, reward_plot, ticket_plot, quality_plot],
         )
-        state_btn.click(_ui_state, outputs=[state_json, status_box])
+        state_btn.click(_ui_state, outputs=[state_json, status_box, reward_plot, ticket_plot, quality_plot])
         tasks_btn.click(_ui_tasks, outputs=[tasks_json, status_box])
-        grader_btn.click(_ui_grader, outputs=[grader_json, status_box])
+        grader_btn.click(_ui_grader, outputs=[grader_json, status_box, reward_plot, ticket_plot, quality_plot])
 
     return demo
 

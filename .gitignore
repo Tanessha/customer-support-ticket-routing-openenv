@@ -8,3 +8,4 @@ __pycache__/
 *.log
 app/
 baseline.py
+outputs/episode_reports.jsonl
