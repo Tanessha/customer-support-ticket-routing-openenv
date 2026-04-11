@@ -18,8 +18,8 @@ from tools.policy_engine import TicketPolicyEngine
 
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 HF_TOKEN = os.getenv("HF_TOKEN")
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
 TASK_NAME = os.getenv("MY_ENV_V4_TASK", "all")
 BENCHMARK = os.getenv("MY_ENV_V4_BENCHMARK", "customer-support-ticket-routing")
 MAX_STEPS = int(os.getenv("MAX_STEPS", "8"))
